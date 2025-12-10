@@ -3,90 +3,120 @@ pragma solidity ^0.8.26;
 
 /**
  * @title TokenBridgeX
- * @notice Cross-chain token bridge using lock & mint mechanism.
- * @dev Validator/Oracle confirms deposit events from source chain.
+ * @notice A simple and secure token bridge that locks tokens on Chain A
+ *         and allows unlocking on Chain B using authorized bridge operators.
  */
 
 interface IERC20 {
-    function transferFrom(address, address, uint256) external returns (bool);
-    function transfer(address, uint256) external returns (bool);
-    function mint(address, uint256) external;
-    function burn(address, uint256) external;
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    function transfer(address recipient, uint256 amount) external returns (bool);
 }
 
 contract TokenBridgeX {
-    address public admin;
-    address public validator; // confirms cross-chain event
-    IERC20 public token;
+    address public owner;
+    mapping(address => bool) public bridgeOperators;
 
-    // Track processed deposits to avoid double minting
-    mapping(bytes32 => bool) public processedDeposits;
+    struct BridgeTransfer {
+        address user;
+        address token;
+        uint256 amount;
+        uint256 timestamp;
+        bytes32 transferId;
+        bool processed;
+    }
 
-    event Locked(address indexed user, uint256 amount, uint256 toChainId);
-    event Minted(address indexed user, uint256 amount, bytes32 depositHash);
-    event Burned(address indexed user, uint256 amount, uint256 toChainId);
-    event Released(address indexed user, uint256 amount, bytes32 burnHash);
+    mapping(bytes32 => BridgeTransfer) public transfers;
 
-    modifier onlyValidator() {
-        require(msg.sender == validator, "Not validator");
+    event TokensLocked(
+        address indexed user,
+        address indexed token,
+        uint256 amount,
+        bytes32 transferId
+    );
+
+    event TokensReleased(
+        address indexed user,
+        address indexed token,
+        uint256 amount,
+        bytes32 transferId
+    );
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner");
         _;
     }
 
-    constructor(address _token, address _validator) {
-        token = IERC20(_token);
-        validator = _validator;
-        admin = msg.sender;
+    modifier onlyOperator() {
+        require(bridgeOperators[msg.sender], "Not bridge operator");
+        _;
     }
 
-    /**
-     * @notice Lock tokens on current chain to be minted on another chain
-     */
-    function lockTokens(uint256 amount, uint256 toChainId) external {
-        require(token.transferFrom(msg.sender, address(this), amount), "Lock failed");
-        emit Locked(msg.sender, amount, toChainId);
+    constructor() {
+        owner = msg.sender;
     }
 
-    /**
-     * @notice Mint wrapped token (on destination chain) after validator confirmation
-     */
-    function mintWrappedToken(
-        address user,
-        uint256 amount,
-        bytes32 depositHash
-    ) external onlyValidator {
-        require(!processedDeposits[depositHash], "Already processed");
-        processedDeposits[depositHash] = true;
-        token.mint(user, amount);
-        emit Minted(user, amount, depositHash);
+    // ─────────────────────────────────────────────
+    // ⭐ ADD / REMOVE BRIDGE OPERATORS
+    // ─────────────────────────────────────────────
+    function addOperator(address operator) external onlyOwner {
+        bridgeOperators[operator] = true;
     }
 
-    /**
-     * @notice Burn tokens on wrapped chain to release original tokens
-     */
-    function burnTokens(uint256 amount, uint256 toChainId) external {
-        token.burn(msg.sender, amount);
-        emit Burned(msg.sender, amount, toChainId);
+    function removeOperator(address operator) external onlyOwner {
+        bridgeOperators[operator] = false;
     }
 
-    /**
-     * @notice Release locked tokens (on original chain) after validator confirmation
-     */
-    function releaseTokens(
-        address user,
-        uint256 amount,
-        bytes32 burnHash
-    ) external onlyValidator {
-        require(!processedDeposits[burnHash], "Already processed");
-        processedDeposits[burnHash] = true;
-        require(token.transfer(user, amount), "Release failed");
-        emit Released(user, amount, burnHash);
+    // ─────────────────────────────────────────────
+    // ⭐ LOCK TOKENS ON SOURCE CHAIN
+    // ─────────────────────────────────────────────
+    function lockTokens(address token, uint256 amount) external {
+        require(token != address(0), "Token required");
+        require(amount > 0, "Invalid amount");
+
+        // Lock on-chain (bridge holds tokens)
+        IERC20(token).transferFrom(msg.sender, address(this), amount);
+
+        // Generate unique transfer ID
+        bytes32 transferId = keccak256(
+            abi.encodePacked(msg.sender, token, amount, block.timestamp, block.number)
+        );
+
+        transfers[transferId] = BridgeTransfer(
+            msg.sender,
+            token,
+            amount,
+            block.timestamp,
+            transferId,
+            false
+        );
+
+        emit TokensLocked(msg.sender, token, amount, transferId);
     }
 
-    /**
-     * @notice Update validator for security rotation
-     */
-    function updateValidator(address newValidator) external {
-        require(msg.sender == admin, "Only admin");
-        validator = newValidator;
+    // ─────────────────────────────────────────────
+    // ⭐ RELEASE TOKENS ON DESTINATION CHAIN
+    // ─────────────────────────────────────────────
+    function releaseTokens(bytes32 transferId, address user, address token, uint256 amount)
+        external
+        onlyOperator
+    {
+        BridgeTransfer storage record = transfers[transferId];
+        require(!record.processed, "Already released");
+        require(user != address(0), "Invalid user");
+        require(amount > 0, "Invalid amount");
+
+        record.processed = true;
+
+        // Send tokens from bridge vault to user
+        IERC20(token).transfer(user, amount);
+
+        emit TokensReleased(user, token, amount, transferId);
+    }
+
+    // ─────────────────────────────────────────────
+    // ⭐ VIEW HELPERS
+    // ─────────────────────────────────────────────
+    function getTransfer(bytes32 transferId) external view returns (BridgeTransfer memory) {
+        return transfers[transferId];
     }
 }
